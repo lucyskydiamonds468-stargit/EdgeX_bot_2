@@ -163,82 +163,41 @@ async def get_ticker_mid_price(base_url: str, contract_id: str) -> Optional[floa
 async def fetch_unrealized_pnl(
     client: EdgeXClient, account_id: int, contract_id: str
 ) -> Optional[float]:
-    """Try to fetch unrealized PnL for a specific account+contract.
-
-    Returns positive for profit, negative for loss. None if unavailable.
+    """EdgeX SDKに合わせた厳密版: account.get_account_positions() を無引数で呼ぶ。
+    未実現P/Lは data.positionAssetList[].unrealizePnl を、contractId 一致の要素から取得する。
+    見つからなければ None。
     """
-    candidates: List[Tuple[str, str]] = [
-        ("account", "get_position_page"),
-        ("account", "get_positions"),
-        ("account", "get_account_positions"),
-        ("position", "get_position_page"),
-        ("position", "get_positions"),
-        ("", "get_positions"),
-    ]
-    resp: Any = None
-    for ns, fn in candidates:
-        try:
-            target = getattr(client, ns) if ns else client
-            if not hasattr(target, fn):
-                continue
-            method = getattr(target, fn)
-            # common param variants
-            param_variants = [
-                {"accountId": str(account_id), "contractId": str(contract_id), "size": "200"},
-                {"accountId": str(account_id), "contractIdList": [str(contract_id)], "size": "200"},
-                {"account_id": account_id, "contract_id": str(contract_id), "size": 200},
-                {"params": {"accountId": str(account_id), "contractId": str(contract_id), "size": "200"}},
-            ]
-            for pv in param_variants:
-                try:
-                    resp = await method(**pv)  # type: ignore[arg-type]
-                    break
-                except TypeError:
-                    continue
-            if resp is None:
-                try:
-                    resp = await method(accountId=str(account_id))
-                except Exception:
-                    pass
-            if resp is not None:
-                break
-        except Exception:
-            continue
-
-    if resp is None:
-        return None
     try:
-        rows = _extract_rows_generic(resp)
+        if not hasattr(client, "account") or not hasattr(client.account, "get_account_positions"):
+            return None
+        resp = await client.account.get_account_positions()
     except Exception:
-        rows = []
-    pnl_total: float = 0.0
-    matched = False
-    for r in rows or []:
-        if not isinstance(r, dict):
-            continue
-        cid = str(r.get("contractId") or r.get("symbol") or r.get("contract_id") or "")
-        if cid and cid != str(contract_id):
-            continue
-        matched = True
-        # common PnL keys across variants
-        for k in (
-            "unrealizedPnl",
-            "unRealizedPnl",
-            "unrealizedProfit",
-            "floatingProfit",
-            "profitAndLoss",
-            "pnl",
-        ):
-            v = r.get(k)
-            if v is not None:
-                try:
-                    pnl_total += float(str(v))
-                except Exception:
-                    pass
-                break
-    if not matched:
+        if _env_bool("MIRROR_DEBUG", False):
+            logger.debug("pnl fetch: get_account_positions() failed accountId={} contractId={}", account_id, contract_id)
         return None
-    return pnl_total
+
+    if not isinstance(resp, dict) or resp.get("code") != "SUCCESS":
+        return None
+    data = resp.get("data", {}) if isinstance(resp, dict) else {}
+    # positionAssetList から contractId 一致を抽出
+    pos_assets = data.get("positionAssetList") or []
+    if not isinstance(pos_assets, list):
+        pos_assets = []
+    target_asset: Optional[dict] = None
+    for a in pos_assets:
+        if isinstance(a, dict) and str(a.get("contractId")) == str(contract_id):
+            target_asset = a
+            break
+    if target_asset is None:
+        return None
+    # unrealizePnl（または unrealizedPnl）を取得
+    v = target_asset.get("unrealizePnl")
+    if v is None:
+        v = target_asset.get("unrealizedPnl")
+    try:
+        return float(str(v)) if v is not None else None
+    except Exception:
+        return None
 
 def round_size_to_step(qty: float, rules: Dict[str, float]) -> float:
     step_env = os.getenv("EDGEX_SIZE_STEP")
@@ -667,28 +626,40 @@ async def mirror_once(
     if size <= 0:
         return
 
-    # 含み益/損でポリシーを分岐
+    # ポリシー:
+    # - 参照口座が含み益(>0): 既存ヘッジは解除（自口座=0）。
+    # - 参照口座が含み損(<=0): |PnL| >= しきい値(MIRROR_NOTIONAL_TRIGGER_USD)のときのみ新規ヘッジ。
+    # - PnLが取得できないとき: 何もしない（安全側）。
     ref_pnl = await fetch_unrealized_pnl(ref_client, ref_account_id, str(contract_id))
-    if ref_pnl is not None:
-        if ref_pnl > 0:
-            # 参照口座が含み益 → ヘッジは不要。既存ヘッジがあれば解除（自口座=0へ）。
-            target_gap = 0.0 - own_net
-            size = abs(target_gap)
-            size = round_size_to_step(size, rules)
-            if size <= 0:
-                return
-            side = "BUY" if target_gap > 0 else "SELL"
-            res = await place_market_order(client_own, str(contract_id), side, size)
-            logger.info("mirror close-hedge: cid={} side={} size={} pnl_ref={} -> {}", contract_id, side, size, ref_pnl, res)
+    if _env_bool("MIRROR_DEBUG", False):
+        logger.debug("pnl gate: ref_account_id={} cid={} ref_pnl={}", ref_account_id, contract_id, ref_pnl)
+    # Always show main account PnL even when debug is off
+    logger.info("pnl ref: account_id={} cid={} pnl={}", ref_account_id, contract_id, (ref_pnl if ref_pnl is not None else "N/A"))
+    if ref_pnl is None:
+        return
+    if ref_pnl > 0:
+        target_gap = 0.0 - own_net
+        # microクローズ抑止: 閾値（デフォルトはsize_step、環境変数で上書き可能）
+        try:
+            close_epsilon = float(os.getenv("MIRROR_CLOSE_EPSILON", ""))
+        except Exception:
+            close_epsilon = 0.0
+        if not close_epsilon:
+            close_epsilon = float(rules.get("size_step", 0.0) or 0.0)
+        raw_close = abs(target_gap)
+        if close_epsilon and raw_close < close_epsilon:
             return
-        # 含み損側のみ、閾値で新規ヘッジを許可
-        if notional_trigger_usd and notional_trigger_usd > 0:
-            price = await get_ticker_mid_price(base_url, str(contract_id))
-            if price is None:
-                return
-            notional = abs(gap) * float(price)
-            if notional < notional_trigger_usd:
-                return
+        close_sz = round_size_to_step(raw_close, rules)
+        if close_sz <= 0:
+            return
+        side = "BUY" if target_gap > 0 else "SELL"
+        res = await place_market_order(client_own, str(contract_id), side, close_sz)
+        logger.info("mirror close-hedge: cid={} side={} size={} pnl_ref={} -> {}", contract_id, side, close_sz, ref_pnl, res)
+        return
+    # 含み損（負またはゼロ）。絶対値が閾値未満ならスキップ
+    if notional_trigger_usd and notional_trigger_usd > 0:
+        if abs(float(ref_pnl)) < notional_trigger_usd:
+            return
 
     side = "BUY" if gap > 0 else "SELL"  # move own towards -ref
     res = await place_market_order(client_own, str(contract_id), side, size)
