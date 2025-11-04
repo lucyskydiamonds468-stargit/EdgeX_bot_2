@@ -200,6 +200,8 @@ async def fetch_unrealized_pnl(
         return None
 
 def round_size_to_step(qty: float, rules: Dict[str, float]) -> float:
+    if qty <= 0:
+        return 0.0
     step_env = os.getenv("EDGEX_SIZE_STEP")
     step = None
     try:
@@ -210,8 +212,11 @@ def round_size_to_step(qty: float, rules: Dict[str, float]) -> float:
     except Exception:
         step = None
     if step and step > 0:
+        # 切り捨て丸め（発注は現在量以下に限定。最小ロットへの繰り上げはしない）
         units = int(qty / step)
-        qty = max(step, units * step)
+        qty = units * step
+    if qty <= 0:
+        return 0.0
     min_sz = None
     try:
         if "min_size" in rules:
@@ -219,7 +224,8 @@ def round_size_to_step(qty: float, rules: Dict[str, float]) -> float:
     except Exception:
         min_sz = None
     if min_sz and qty < min_sz:
-        qty = min_sz
+        # 取引所の最小サイズに満たない調整は発注しない（往復振動を防止）
+        return 0.0
     return qty
 
 
@@ -598,7 +604,6 @@ async def mirror_once(
     ref_account_id: int,
     own_account_id: int,
     contract_id: str,
-    band: float,
     step_cap: float,
     *,
     ref_client: Optional[EdgeXClient] = None,
@@ -616,18 +621,8 @@ async def mirror_once(
     gap = (-ref_net) - own_net
 
     logger.debug("mirror: cid={} ref={} own={} gap={}", contract_id, ref_net, own_net, gap)
-    if abs(gap) <= max(0.0, band):
-        return
-
-    size = abs(gap)
-    if step_cap and step_cap > 0:
-        size = min(size, step_cap)
-    size = round_size_to_step(size, rules)
-    if size <= 0:
-        return
-
     # ポリシー:
-    # - 参照口座が含み益(>0): 既存ヘッジは解除（自口座=0）。
+    # - 参照口座が含み益(>0): 既存ヘッジは解除（自口座=0）。このとき band は無視する。
     # - 参照口座が含み損(<=0): |PnL| >= しきい値(MIRROR_NOTIONAL_TRIGGER_USD)のときのみ新規ヘッジ。
     # - PnLが取得できないとき: 何もしない（安全側）。
     ref_pnl = await fetch_unrealized_pnl(ref_client, ref_account_id, str(contract_id))
@@ -635,31 +630,50 @@ async def mirror_once(
         logger.debug("pnl gate: ref_account_id={} cid={} ref_pnl={}", ref_account_id, contract_id, ref_pnl)
     # Always show main account PnL even when debug is off
     logger.info("pnl ref: account_id={} cid={} pnl={}", ref_account_id, contract_id, (ref_pnl if ref_pnl is not None else "N/A"))
+    # 発注ゲートの詳細を可視化
+    try:
+        trig = float(notional_trigger_usd or 0.0)
+    except Exception:
+        trig = 0.0
+    if ref_pnl is not None:
+        is_profit = (ref_pnl > 0)
+        abs_pnl = abs(float(ref_pnl))
+        triggered = (not is_profit) and (trig <= 0.0 or abs_pnl >= trig)
+        logger.info(
+            "gate detail: profit={} abs_pnl={} trigger_usd={} triggered={}",
+            is_profit,
+            abs_pnl,
+            trig,
+            triggered,
+        )
     if ref_pnl is None:
         return
     if ref_pnl > 0:
         target_gap = 0.0 - own_net
-        # microクローズ抑止: 閾値（デフォルトはsize_step、環境変数で上書き可能）
-        try:
-            close_epsilon = float(os.getenv("MIRROR_CLOSE_EPSILON", ""))
-        except Exception:
-            close_epsilon = 0.0
-        if not close_epsilon:
-            close_epsilon = float(rules.get("size_step", 0.0) or 0.0)
         raw_close = abs(target_gap)
-        if close_epsilon and raw_close < close_epsilon:
-            return
         close_sz = round_size_to_step(raw_close, rules)
         if close_sz <= 0:
             return
         side = "BUY" if target_gap > 0 else "SELL"
+        # 予想後ポジションを事前評価（絶対値が減らない注文はスキップして振動防止）
+        predicted_net = own_net + close_sz if side == "BUY" else own_net - close_sz
+        if abs(predicted_net) >= abs(own_net) - 1e-12:
+            return
         res = await place_market_order(client_own, str(contract_id), side, close_sz)
         logger.info("mirror close-hedge: cid={} side={} size={} pnl_ref={} -> {}", contract_id, side, close_sz, ref_pnl, res)
         return
-    # 含み損（負またはゼロ）。絶対値が閾値未満ならスキップ
+
+    # 含み損（負またはゼロ）側: しきい値のみ評価して新規/調整
     if notional_trigger_usd and notional_trigger_usd > 0:
         if abs(float(ref_pnl)) < notional_trigger_usd:
             return
+
+    size = abs(gap)
+    if step_cap and step_cap > 0:
+        size = min(size, step_cap)
+    size = round_size_to_step(size, rules)
+    if size <= 0:
+        return
 
     side = "BUY" if gap > 0 else "SELL"  # move own towards -ref
     res = await place_market_order(client_own, str(contract_id), side, size)
@@ -777,10 +791,6 @@ async def main() -> None:
     except Exception:
         poll_interval = 3.0
     try:
-        band = float(os.getenv("MIRROR_BAND", cfg.get("mirror_band", 0.0)))
-    except Exception:
-        band = 0.0
-    try:
         step_cap = float(os.getenv("MIRROR_STEP_MAX", cfg.get("mirror_step_max", 0.0)))
     except Exception:
         step_cap = 0.0
@@ -825,8 +835,8 @@ async def main() -> None:
             logger.info("参照アカウントに保有ポジションが見つかりませんでした（自動検出=0件）。待機します。")
 
     try:
-        logger.info("mirror hedger boot: base_url={} account_id={} ref_account_id={} symbols={} poll={}s band={} step_cap={} ref_mode=client",
-                    base_url, api_id, ref_id_env, symbols, poll_interval, band, step_cap)
+        logger.info("mirror hedger boot: base_url={} account_id={} ref_account_id={} symbols={} poll={}s step_cap={} trigger_usd={} ref_mode=client",
+                    base_url, api_id, ref_id_env, symbols, poll_interval, step_cap, notional_trigger_usd)
         while True:
             for cid in symbols:
                 try:
@@ -836,7 +846,6 @@ async def main() -> None:
                         int(ref_id_env),
                         int(api_id),
                         str(cid),
-                        band,
                         step_cap,
                         ref_client=ref_client,
                         notional_trigger_usd=notional_trigger_usd,
