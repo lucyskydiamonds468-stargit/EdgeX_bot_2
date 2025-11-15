@@ -852,7 +852,7 @@ async def main() -> None:
                     )
                 except Exception as e:
                     logger.warning("mirror for cid={} failed: {}", cid, e)
-            await asyncio.sleep(max(1.0, poll_interval))
+            await asyncio.sleep(7.0)
     finally:
         try:
             await client.close()
@@ -865,5 +865,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("stopped by user")
+
 
 
