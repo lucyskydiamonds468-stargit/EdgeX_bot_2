@@ -721,7 +721,7 @@ async def auth_check_if_required(cfg: Dict[str, Any], api_id: str) -> None:
             msg = str(e)
             if "Timeout" in msg or isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.HTTPError)):
                 if i < attempts - 1:
-                    await asyncio.sleep(backoff)
+                    await asyncio.sleep(7.0)
                     backoff = min(backoff * 1.8, 6.0)
                     continue
             break
@@ -865,6 +865,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("stopped by user")
+
 
 
 
